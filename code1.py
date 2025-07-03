@@ -93,7 +93,7 @@ class F1OptimizedAugmentation:
         if random.random() > self.prob:
             return x
         signal_std = x.std(dim=0, keepdim=True)
-        noise = torch.normal(0, noise_factor * signal_std, x.shape)
+        noise = torch.normal(0.0, noise_factor * signal_std.expand_as(x))
         return x + noise
 
     def selective_cutout(self, x, max_holes=2, max_length=15):
@@ -345,9 +345,22 @@ def hyperparameter_search(data, labels, n_trials=10):
     print(f"Using device: {device}")
 
     def objective(trial, data, labels):
+        """
+        # Suggest d_model first
+        d_model = trial.suggest_int("d_model", 256, 384, step=32)
+        # Only allow nhead values that divide d_model evenly
+        valid_nheads = [n for n in range(4, 13, 2) if d_model % n == 0]
+        if not valid_nheads:
+            raise optuna.TrialPruned()  # Prune invalid d_model values
+        nhead = trial.suggest_categorical("nhead", valid_nheads)
+        """
+        valid_pairs = [
+            (d, n) for d in range(256, 385, 32) for n in range(4, 13, 2) if d % n == 0
+        ]
+        d_model, nhead = trial.suggest_categorical("model", valid_pairs)
         config = {
-            "d_model": trial.suggest_int("d_model", 256, 384, step=32),
-            "nhead": trial.suggest_int("nhead", 4, 12, step=2),
+            "d_model": d_model,
+            "nhead": nhead,
             "num_encoder_layers": trial.suggest_int(
                 "num_encoder_layers", 4, 10, step=2
             ),
