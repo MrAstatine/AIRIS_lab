@@ -11,7 +11,7 @@ from sklearn.metrics import (
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
-from torch.optim.lr_scheduler import CyclicLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from scipy.ndimage import gaussian_filter1d
 import numpy as np
 import random
@@ -32,7 +32,7 @@ output_dir = "./outputs"
 os.makedirs(output_dir, exist_ok=True)
 
 # Load dataset
-dataset_path = "final_dataset.npz"  # Update path if needed
+dataset_path = "final_dataset.npz"
 try:
     data_npz = np.load(dataset_path)
     print("Available keys in .npz file:", list(data_npz.keys()))
@@ -64,19 +64,19 @@ print("Training class counts:", np.bincount(y_train))
 print("Validation class counts:", np.bincount(y_val))
 
 
-# F1OptimizedAugmentation
-class F1OptimizedAugmentation:
-    def __init__(self, prob=0.7):  # Reduced probability
+# Balanced Augmentation
+class BalancedAugmentation:
+    def __init__(self, prob=0.5):
         self.prob = prob
 
-    def time_warp(self, x, is_minority=False):
-        sigma = 0.1 if is_minority else 0.05  # Reduced warping
+    def time_warp(self, x):
         if random.random() > self.prob:
             return x
+        sigma = 0.02  # Much smaller warping
         seq_len = x.shape[0]
         tt = torch.arange(seq_len).float()
         warp = torch.normal(0, sigma, (seq_len,)).cumsum(0)
-        warp = (warp - warp.mean()) / warp.std() * sigma
+        warp = (warp - warp.mean()) / (warp.std() + 1e-8) * sigma
         warped_tt = torch.clamp(tt + warp, 0, seq_len - 1)
         indices = warped_tt.long()
         weights = warped_tt - indices.float()
@@ -88,103 +88,48 @@ class F1OptimizedAugmentation:
             ]
         return warped_x
 
-    def magnitude_warp(self, x, is_minority=False):
-        sigma = 0.1 if is_minority else 0.05  # Reduced warping
+    def add_noise(self, x):
         if random.random() > self.prob:
             return x
-        seq_len = x.shape[0]
-        knots = torch.randint(3, 5, (1,)).item()  # Fewer knots
-        warped_x = x.clone()
-        for c in range(x.shape[1]):
-            knot_pos = torch.linspace(0, seq_len - 1, knots)
-            knot_val = torch.normal(1.0, sigma, (knots,))
-            warp_curve = torch.zeros(seq_len)
-            for i in range(seq_len):
-                li = torch.searchsorted(knot_pos, float(i), right=False) - 1
-                li = torch.clamp(li, 0, knots - 2)
-                ri = li + 1
-                t = (i - knot_pos[li]) / (knot_pos[ri] - knot_pos[li])
-                warp_curve[i] = (1 - t) * knot_val[li] + t * knot_val[ri]
-            warp_curve = torch.from_numpy(
-                gaussian_filter1d(warp_curve.numpy(), 1.0)  # Reduced smoothing
-            ).float()
-            warped_x[:, c] *= warp_curve
-        return warped_x
-
-    def intelligent_noise(self, x, is_minority=False):
-        noise_factor = 0.02 if is_minority else 0.01  # Reduced noise
-        if random.random() > self.prob:
-            return x
-        signal_std = x.std(dim=0, keepdim=True)
-        noise = torch.normal(0.0, noise_factor * signal_std.expand_as(x))
+        noise_level = 0.005  # Very small noise
+        noise = torch.normal(0, noise_level, x.shape)
         return x + noise
 
-    def selective_cutout(self, x, is_minority=False):
-        max_holes = 2 if is_minority else 1  # Fewer holes
-        max_length = 10 if is_minority else 5  # Shorter holes
+    def magnitude_scale(self, x):
         if random.random() > self.prob:
             return x
-        seq_len, augmented = x.shape[0], x.clone()
-        variance = torch.var(x, dim=1)
-        threshold = torch.quantile(variance, 0.8)
-        for _ in range(random.randint(1, max_holes)):
-            length = random.randint(3, max_length)
-            for _ in range(10):
-                start = random.randint(0, max(1, seq_len - length))
-                if variance[start : start + length].mean() < threshold:
-                    break
-            fill = (
-                (
-                    x[start - 2 : start, :].mean(0)
-                    + x[start + length : start + length + 2, :].mean(0)
-                )
-                / 2
-                if start > 2 and start + length < seq_len - 2
-                else x.mean(0)
-            )
-            augmented[start : start + length] = fill
-        return augmented
+        scale = torch.normal(1.0, 0.02, (1, x.shape[1]))  # Small scaling
+        return x * scale
 
-    def __call__(self, x, is_minority=False):
-        return self.selective_cutout(
-            self.intelligent_noise(
-                self.magnitude_warp(self.time_warp(x, is_minority), is_minority),
-                is_minority,
-            ),
-            is_minority,
-        )
+    def __call__(self, x):
+        x = self.time_warp(x)
+        x = self.add_noise(x)
+        x = self.magnitude_scale(x)
+        return x
 
 
-# F1FocusedDataset
-class F1FocusedDataset(Dataset):
-    def __init__(self, data, labels, normalize=True, augment=False, class_weights=None):
+# Balanced Dataset
+class BalancedDataset(Dataset):
+    def __init__(self, data, labels, normalize=True, augment=False):
         self.original_data = torch.FloatTensor(data)
         self.labels = torch.LongTensor(labels)
         self.augment = augment
-        self.class_weights = class_weights
         self.data = (
-            self._robust_normalize(self.original_data)
+            self._normalize(self.original_data)
             if normalize
             else self.original_data.clone()
         )
         if augment:
-            self.augmenter = F1OptimizedAugmentation(prob=0.7)  # Reduced probability
-        self.minority_class = 2
+            self.augmenter = BalancedAugmentation(prob=0.3)
 
-    def _robust_normalize(self, data):
+    def _normalize(self, data):
+        # Simple z-score normalization per channel
         normed = data.clone()
         for c in range(data.shape[2]):
             channel_data = data[:, :, c]
-            q05, q25, q50, q75, q95 = torch.quantile(
-                channel_data.flatten(), torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95])
-            )
-            iqr = q75 - q25
-            clipped = torch.clamp(channel_data, q05, q95)
-            if iqr > 1e-6:
-                normed[:, :, c] = (clipped - q50) / (1.4826 * iqr)
-            else:
-                mean, std = clipped.mean(), clipped.std()
-                normed[:, :, c] = (clipped - mean) / (std + 1e-8)
+            mean = channel_data.mean()
+            std = channel_data.std()
+            normed[:, :, c] = (channel_data - mean) / (std + 1e-8)
         return normed
 
     def __len__(self):
@@ -193,253 +138,151 @@ class F1FocusedDataset(Dataset):
     def __getitem__(self, idx):
         x = self.data[idx].clone()
         y = self.labels[idx]
-        if self.augment:
-            is_minority = y == self.minority_class
-            aug_prob = 0.8 if is_minority else 0.4  # Reduced augmentation probability
-            if random.random() < aug_prob:
-                x = self.augmenter(x, is_minority=is_minority)
+        if self.augment and random.random() < 0.3:  # Lower augmentation rate
+            x = self.augmenter(x)
         return x, y
 
 
-# AttentiveMultiScaleCNN
-class AttentiveMultiScaleCNN(nn.Module):
-    def __init__(self, input_channels, d_model):
+# Simplified CNN-LSTM Model
+class SimplifiedCNNLSTM(nn.Module):
+    def __init__(self, input_channels=3, num_classes=3):
         super().__init__()
-        self.scale1 = nn.Sequential(
-            nn.Conv1d(input_channels, 32, 3, padding=1),  # Reduced channels
+
+        # CNN feature extractor
+        self.cnn = nn.Sequential(
+            nn.Conv1d(input_channels, 32, kernel_size=7, padding=3),
             nn.BatchNorm1d(32),
-            nn.GELU(),
-            nn.Conv1d(32, 48, 3, padding=1),
-            nn.BatchNorm1d(48),
-            nn.GELU(),
-            nn.Conv1d(48, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.1),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
-            nn.GELU(),
-        )
-        self.residual1 = nn.Conv1d(input_channels, 64, 1)
-
-        self.scale2 = nn.Sequential(
-            nn.Conv1d(input_channels, 32, 7, padding=3),
-            nn.BatchNorm1d(32),
-            nn.GELU(),
-            nn.Conv1d(32, 48, 7, padding=3),
-            nn.BatchNorm1d(48),
-            nn.GELU(),
-            nn.Conv1d(48, 64, 5, padding=2),
-            nn.BatchNorm1d(64),
-            nn.GELU(),
-        )
-        self.residual2 = nn.Conv1d(input_channels, 64, 1)
-
-        self.scale3 = nn.Sequential(
-            nn.Conv1d(input_channels, 32, 11, padding=5),
-            nn.BatchNorm1d(32),
-            nn.GELU(),
-            nn.Conv1d(32, 48, 9, padding=4),
-            nn.BatchNorm1d(48),
-            nn.GELU(),
-            nn.Conv1d(48, 64, 7, padding=3),
-            nn.BatchNorm1d(64),
-            nn.GELU(),
-        )
-        self.residual3 = nn.Conv1d(input_channels, 64, 1)
-
-        self.channel_attention = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Conv1d(192, 48, 1),  # Adjusted for new channel count
-            nn.GELU(),
-            nn.Conv1d(48, 192, 1),
-            nn.Sigmoid(),
-        )
-        self.combine = nn.Sequential(
-            nn.Conv1d(192, d_model, 1),
-            nn.BatchNorm1d(d_model),
-            nn.GELU(),
-            nn.Dropout(0.2),  # Reduced dropout
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.1),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.1),
         )
 
-    def forward(self, x):
-        x = x.transpose(1, 2)
-        s1 = self.scale1(x) + self.residual1(x)
-        s2 = self.scale2(x) + self.residual2(x)
-        s3 = self.scale3(x) + self.residual3(x)
-        combined = torch.cat([s1, s2, s3], dim=1)
-        attention = self.channel_attention(combined)
-        combined = combined * attention
-        output = self.combine(combined)
-        return output.transpose(1, 2)
-
-
-# EnhancedPositionalEncoding
-class EnhancedPositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=1000, dropout=0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x):
-        x = x + self.pe[:, : x.size(1)]
-        return self.dropout(x)
-
-
-# F1OptimizedTransformer
-class F1OptimizedTransformer(nn.Module):
-    def __init__(
-        self,
-        input_channels=3,
-        d_model=256,  # Reduced model dimension
-        nhead=8,
-        num_encoder_layers=4,  # Reduced layers
-        dim_feedforward=1024,  # Reduced feedforward dimension
-        dropout=0.2,  # Reduced dropout
-        num_classes=3,
-        max_seq_len=1000,
-    ):
-        super().__init__()
-        self.feature_extractor = AttentiveMultiScaleCNN(input_channels, d_model)
-        self.pos_encoder = EnhancedPositionalEncoding(d_model, max_seq_len, dropout)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model,
-            nhead,
-            dim_feedforward,
-            dropout,
+        # LSTM for temporal modeling
+        self.lstm = nn.LSTM(
+            input_size=128,
+            hidden_size=64,
+            num_layers=2,
             batch_first=True,
-            norm_first=False,
-            activation="gelu",
+            dropout=0.1,
+            bidirectional=True,
         )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, num_encoder_layers
-        )
-        self.pool_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-        self.attention_pool = nn.MultiheadAttention(
-            d_model, nhead, batch_first=True, dropout=dropout
-        )
-        self.pre_classifier = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+
+        # Classifier
         self.classifier = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, dim_feedforward // 2),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(dim_feedforward // 2, dim_feedforward // 4),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.25),
-            nn.Linear(dim_feedforward // 4, num_classes),
+            nn.Linear(128, 64),  # 64*2 from bidirectional LSTM
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, num_classes),
         )
+
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.xavier_normal_(module.weight, gain=0.5)  # Reduced gain
+            torch.nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Conv1d):
-            torch.nn.init.kaiming_normal_(
-                module.weight, mode="fan_out", nonlinearity="relu"
+            torch.nn.init.kaiming_uniform_(
+                module.weight, mode="fan_in", nonlinearity="relu"
             )
 
     def forward(self, x):
-        x = self.feature_extractor(x)
-        x = self.pos_encoder(x)
-        x = self.transformer_encoder(x)
-        batch_size = x.size(0)
-        query = self.pool_query.expand(batch_size, -1, -1)
-        attn_output, _ = self.attention_pool(query, x, x)
-        x = self.pre_classifier(attn_output.squeeze(1))
+        # x shape: (batch_size, seq_len, channels)
+        x = x.transpose(1, 2)  # (batch_size, channels, seq_len)
+
+        # CNN feature extraction
+        x = self.cnn(x)  # (batch_size, 128, seq_len/8)
+
+        # Prepare for LSTM
+        x = x.transpose(1, 2)  # (batch_size, seq_len/8, 128)
+
+        # LSTM
+        lstm_out, (h_n, c_n) = self.lstm(x)
+
+        # Use last hidden state
+        x = (
+            h_n[-1]
+            if not self.lstm.bidirectional
+            else torch.cat([h_n[-2], h_n[-1]], dim=1)
+        )
+
+        # Classification
         x = self.classifier(x)
         return x
 
 
-# Simplified Loss Function
-class ImprovedFocalLoss(nn.Module):
-    def __init__(
-        self, alpha=None, gamma=2.0, label_smoothing=0.05
-    ):  # Reduced gamma and label smoothing
+# Balanced Loss Function
+class BalancedCrossEntropyLoss(nn.Module):
+    def __init__(self, weight=None, label_smoothing=0.0):
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
+        self.weight = weight
         self.label_smoothing = label_smoothing
 
-    def forward(self, inputs, targets):
-        ce_loss = torch.nn.functional.cross_entropy(
-            inputs,
-            targets,
-            weight=self.alpha,
-            label_smoothing=self.label_smoothing,
-            reduction="none",
+    def forward(self, input, target):
+        return nn.functional.cross_entropy(
+            input, target, weight=self.weight, label_smoothing=self.label_smoothing
         )
-        pt = torch.exp(-ce_loss)
-        focal_loss = (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean()
 
 
-# Improved WeightedRandomSampler
+# More balanced sampling
 class_counts = np.bincount(y_train)
-# More balanced sampling weights
-sample_weights = 1.0 / class_counts[y_train]
-sample_weights[y_train == 2] *= 2.0  # Reduced multiplier for minority class
+# Moderate class balancing - not extreme
+sample_weights = 1.0 / (class_counts + 1e-8)
+sample_weights = sample_weights / sample_weights.sum() * len(sample_weights)
+sample_weights = sample_weights[y_train]
+
+# Cap the maximum weight to prevent extreme imbalance
+max_weight = sample_weights.mean() * 3
+sample_weights = np.clip(sample_weights, None, max_weight)
+
 sampler = WeightedRandomSampler(
     weights=sample_weights, num_samples=len(y_train), replacement=True
 )
 
 # DataLoaders
-train_dataset = F1FocusedDataset(X_train, y_train, normalize=True, augment=True)
-val_dataset = F1FocusedDataset(X_val, y_val, normalize=True, augment=False)
-train_loader = DataLoader(
-    train_dataset, batch_size=16, sampler=sampler, num_workers=4
-)  # Reduced batch size
-val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4)
+train_dataset = BalancedDataset(X_train, y_train, normalize=True, augment=True)
+val_dataset = BalancedDataset(X_val, y_val, normalize=True, augment=False)
+
+train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 
 # Initialize model
-model = F1OptimizedTransformer(
-    input_channels=3,
-    d_model=256,
-    nhead=8,
-    num_encoder_layers=4,
-    dim_feedforward=1024,
-    dropout=0.2,
-    num_classes=3,
-).to(device)
+model = SimplifiedCNNLSTM(input_channels=3, num_classes=3).to(device)
 
 # More balanced class weights
 class_weights = compute_class_weight("balanced", classes=np.unique(y_train), y=y_train)
-class_weights[2] *= 2.0  # Reduced multiplier for minority class
+# Moderate the extreme weights
+class_weights = np.clip(class_weights, 0.5, 3.0)  # Cap weights
 class_weights = torch.FloatTensor(class_weights).to(device)
 print("Class weights:", class_weights)
 
 # Loss and optimizer
-criterion = ImprovedFocalLoss(alpha=class_weights, gamma=2.0, label_smoothing=0.05)
-optimizer = torch.optim.AdamW(
-    model.parameters(), lr=0.001, weight_decay=0.01
-)  # Increased learning rate, reduced weight decay
-scheduler = CyclicLR(
-    optimizer,
-    base_lr=0.0001,
-    max_lr=0.002,  # Increased max learning rate
-    step_size_up=3 * len(train_loader),
-    mode="triangular",
-)
+criterion = BalancedCrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.001)
+scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=0.0001)
 
 # Training loop
-num_epochs = 100  # Reduced epochs
+num_epochs = 50
 best_f1 = 0
-patience = 10  # Reduced patience
+patience = 15
 counter = 0
 train_losses, val_f1s = [], []
 
+print("Starting training...")
 for epoch in range(num_epochs):
     start_time = time.time()
     model.train()
@@ -447,40 +290,41 @@ for epoch in range(num_epochs):
 
     for batch_idx, (x, y) in enumerate(train_loader):
         x, y = x.to(device), y.to(device)
+
         optimizer.zero_grad()
         outputs = model(x)
         loss = criterion(outputs, y)
 
-        # Simplified loss weighting
-        loss_weights = torch.ones_like(y, dtype=torch.float, device=device)
-        loss_weights[y == 2] = 2.0  # Reduced weight for minority class
-        loss = (loss * loss_weights).mean()
-
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(), max_norm=0.5
-        )  # Reduced grad clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        scheduler.step()
+
         epoch_loss += loss.item()
 
-        # Debug: Print prediction distribution every 100 batches
-        if batch_idx % 100 == 0:
+        # Debug: Print prediction distribution every 50 batches
+        if batch_idx % 50 == 0:
             with torch.no_grad():
                 _, pred = outputs.max(1)
                 pred_counts = torch.bincount(pred, minlength=3)
-                print(f"Batch {batch_idx}: Predictions: {pred_counts.cpu().numpy()}")
+                print(
+                    f"Epoch {epoch+1}, Batch {batch_idx}: Predictions: {pred_counts.cpu().numpy()}"
+                )
 
+    scheduler.step()
     train_losses.append(epoch_loss / len(train_loader))
 
     # Validation
     model.eval()
     preds, targets = [], []
+    val_loss = 0.0
+
     with torch.no_grad():
         for x, y in val_loader:
             x, y = x.to(device), y.to(device)
-            out = model(x)
-            _, pred = out.max(1)
+            outputs = model(x)
+            val_loss += criterion(outputs, y).item()
+
+            _, pred = outputs.max(1)
             preds.extend(pred.cpu().numpy())
             targets.extend(y.cpu().numpy())
 
@@ -489,35 +333,39 @@ for epoch in range(num_epochs):
     val_f1s.append(val_f1)
     epoch_time = time.time() - start_time
 
+    print(f"Epoch {epoch+1}/{num_epochs} ({epoch_time:.1f}s)")
     print(
-        f"Epoch {epoch+1}/{num_epochs} ({epoch_time:.1f}s), Loss: {train_losses[-1]:.4f}, Val F1: {val_f1:.4f}, Per-Class F1: Noise={per_class_f1[0]:.4f}, Planetary Transit={per_class_f1[1]:.4f}, EB={per_class_f1[2]:.4f}"
+        f"Train Loss: {train_losses[-1]:.4f}, Val Loss: {val_loss/len(val_loader):.4f}"
+    )
+    print(f"Val F1: {val_f1:.4f}")
+    print(
+        f"Per-Class F1: Noise={per_class_f1[0]:.4f}, Planetary={per_class_f1[1]:.4f}, EB={per_class_f1[2]:.4f}"
     )
     print(f"Prediction counts: {np.bincount(preds, minlength=3)}")
+    print(f"True counts: {np.bincount(targets, minlength=3)}")
+    print("-" * 50)
 
     if val_f1 > best_f1:
         best_f1 = val_f1
         counter = 0
         torch.save(model.state_dict(), os.path.join(output_dir, "best_model.pth"))
+        print(f"New best F1: {best_f1:.4f}")
     else:
         counter += 1
 
-    if (epoch + 1) % 10 == 0:
-        torch.save(
-            model.state_dict(), os.path.join(output_dir, f"model_epoch_{epoch+1}.pth")
-        )
-
     if counter >= patience:
-        print("Early stopping")
+        print("Early stopping triggered")
         break
 
 
-# Evaluate
+# Final evaluation
 def calculate_comprehensive_metrics(targets, preds):
     macro_f1 = f1_score(targets, preds, average="macro")
     per_class_f1 = f1_score(targets, preds, average=None)
-    per_class_precision = precision_score(targets, preds, average=None)
-    per_class_recall = recall_score(targets, preds, average=None)
+    per_class_precision = precision_score(targets, preds, average=None, zero_division=0)
+    per_class_recall = recall_score(targets, preds, average=None, zero_division=0)
     cm = confusion_matrix(targets, preds)
+
     return {
         "macro_f1": macro_f1,
         "per_class_f1": per_class_f1,
@@ -527,78 +375,76 @@ def calculate_comprehensive_metrics(targets, preds):
     }
 
 
-metrics = calculate_comprehensive_metrics(targets, preds)
+# Load best model for final evaluation
+model.load_state_dict(torch.load(os.path.join(output_dir, "best_model.pth")))
+model.eval()
+
+# Final validation predictions
+final_preds, final_targets = [], []
+with torch.no_grad():
+    for x, y in val_loader:
+        x, y = x.to(device), y.to(device)
+        outputs = model(x)
+        _, pred = outputs.max(1)
+        final_preds.extend(pred.cpu().numpy())
+        final_targets.extend(y.cpu().numpy())
+
+metrics = calculate_comprehensive_metrics(final_targets, final_preds)
 class_names = ["Noise", "Planetary Transit", "Eclipsing Binary"]
-print("Final Macro F1:", metrics["macro_f1"])
+
+print("\n" + "=" * 50)
+print("FINAL RESULTS")
+print("=" * 50)
+print(f"Final Macro F1: {metrics['macro_f1']:.4f}")
+print(f"Best F1 during training: {best_f1:.4f}")
+
 for i, name in enumerate(class_names):
-    print(
-        f"{name} F1: {metrics['per_class_f1'][i]:.4f}, Precision: {metrics['per_class_precision'][i]:.4f}, Recall: {metrics['per_class_recall'][i]:.4f}"
-    )
+    print(f"{name}:")
+    print(f"  F1: {metrics['per_class_f1'][i]:.4f}")
+    print(f"  Precision: {metrics['per_class_precision'][i]:.4f}")
+    print(f"  Recall: {metrics['per_class_recall'][i]:.4f}")
 
 # Plot confusion matrix
+plt.figure(figsize=(8, 6))
 disp = ConfusionMatrixDisplay(
     confusion_matrix=metrics["confusion_matrix"], display_labels=class_names
 )
 disp.plot(cmap=plt.cm.Blues)
 plt.title("Confusion Matrix")
-plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
+plt.tight_layout()
+plt.savefig(
+    os.path.join(output_dir, "confusion_matrix.png"), dpi=300, bbox_inches="tight"
+)
 plt.close()
 
-# Plot training loss and validation F1
+# Plot training curves
 plt.figure(figsize=(12, 4))
 plt.subplot(1, 2, 1)
 plt.plot(train_losses, label="Training Loss")
 plt.xlabel("Epoch")
 plt.ylabel("Loss")
+plt.title("Training Loss")
 plt.legend()
+plt.grid(True)
 
 plt.subplot(1, 2, 2)
 plt.plot(val_f1s, label="Validation F1")
 plt.xlabel("Epoch")
 plt.ylabel("F1 Score")
+plt.title("Validation F1 Score")
 plt.legend()
-plt.savefig(os.path.join(output_dir, "training_plot.png"))
+plt.grid(True)
+
+plt.tight_layout()
+plt.savefig(
+    os.path.join(output_dir, "training_curves.png"), dpi=300, bbox_inches="tight"
+)
 plt.close()
 
-# Visualize augmented sample
-eb_idx = np.where(y_train == 2)[0][0]
-x = torch.FloatTensor(X_train[eb_idx])
-augmenter = F1OptimizedAugmentation(prob=1.0)
-x_aug = augmenter(x, is_minority=True)
-plt.figure(figsize=(12, 4))
-for c, name in enumerate(["Flux", "Centroid", "Background"]):
-    plt.subplot(1, 3, c + 1)
-    plt.plot(x[:, c], label="Original")
-    plt.plot(x_aug[:, c], label="Augmented", alpha=0.7)
-    plt.title(f"{name} Channel")
-    plt.legend()
-plt.savefig(os.path.join(output_dir, "augmented_sample.png"))
-plt.close()
-
-# Visualize EB validation samples
-eb_val_idx = np.where(y_val == 2)[0][:3]
-for idx in eb_val_idx:
-    plt.figure(figsize=(6, 4))
-    plt.plot(X_val[idx, :, 0], label="Flux")
-    plt.title(f"EB Validation Sample {idx}")
-    plt.legend()
-    plt.savefig(os.path.join(output_dir, f"eb_sample_{idx}.png"))
-    plt.close()
-
-# Save final model
+# Save results
 torch.save(model.state_dict(), os.path.join(output_dir, "final_model.pth"))
-
-# Save training history
 history = {"train_losses": train_losses, "val_f1s": val_f1s}
 np.savez(os.path.join(output_dir, "training_history.npz"), **history)
 
-# Save class weights
-np.savez(
-    os.path.join(output_dir, "class_weights.npz"),
-    class_weights=class_weights.cpu().numpy(),
-)
-
-print("Training complete. Outputs saved to:", output_dir)
-print("Final model saved as final_model.pth")
-print("Training history saved as training_history.npz")
-print("Class weights saved as class_weights.npz")
+print(f"\nTraining complete. Best F1: {best_f1:.4f}")
+print(f"Outputs saved to: {output_dir}")
