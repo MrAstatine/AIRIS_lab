@@ -22,12 +22,12 @@ random.seed(42)
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Assume data and label are loaded
-# data: shape (2591, 1000, 3), label: shape (2591,)
-X = data
-y = label
-
-# Verify shapes and class distribution
+# === Load dataset ===
+datafile = "final_dataset.npz"
+data_npz = np.load(datafile)
+X = data_npz["data"]
+y = data_npz["label"]
+print("Loaded final_dataset.npz. Keys:", list(data_npz.keys()))
 print("Data shape:", X.shape)
 print("Label shape:", y.shape)
 print("Class counts:", np.bincount(y))
@@ -35,7 +35,7 @@ print("Class counts:", np.bincount(y))
 
 # F1OptimizedAugmentation
 class F1OptimizedAugmentation:
-    def _init_(self, prob=0.95):
+    def __init__(self, prob=0.95):
         self.prob = prob
 
     def time_warp(self, x, is_minority=False):
@@ -94,7 +94,7 @@ class F1OptimizedAugmentation:
         if random.random() > self.prob:
             return x
         seq_len, augmented = x.shape[0], x.clone()
-        variance = torch.var(x[:, 0], dim=0)  # Focus on flux channel
+        variance = torch.var(x, dim=1)  # shape: (seq_len,)
         threshold = torch.quantile(variance, 0.7)
         for _ in range(random.randint(1, max_holes)):
             length = random.randint(3, max_length)
@@ -114,7 +114,7 @@ class F1OptimizedAugmentation:
             augmented[start : start + length] = fill
         return augmented
 
-    def _call_(self, x, is_minority=False):
+    def __call__(self, x, is_minority=False):
         return self.selective_cutout(
             self.intelligent_noise(
                 self.magnitude_warp(self.time_warp(x, is_minority), is_minority),
@@ -126,7 +126,7 @@ class F1OptimizedAugmentation:
 
 # F1FocusedDataset
 class F1FocusedDataset(Dataset):
-    def _init_(self, data, labels, normalize=True, augment=False, class_weights=None):
+    def __init__(self, data, labels, normalize=True, augment=False, class_weights=None):
         self.original_data = torch.FloatTensor(data)
         self.labels = torch.LongTensor(labels)
         self.augment = augment
@@ -156,10 +156,10 @@ class F1FocusedDataset(Dataset):
                 normed[:, :, c] = (clipped - mean) / (std + 1e-8)
         return normed
 
-    def _len_(self):
+    def __len__(self):
         return len(self.data)
 
-    def _getitem_(self, idx):
+    def __getitem__(self, idx):
         x = self.data[idx].clone()
         y = self.labels[idx]
         if self.augment:
@@ -172,8 +172,8 @@ class F1FocusedDataset(Dataset):
 
 # AttentiveMultiScaleCNN
 class AttentiveMultiScaleCNN(nn.Module):
-    def _init_(self, input_channels, d_model):
-        super()._init_()
+    def __init__(self, input_channels, d_model):
+        super().__init__()
         self.scale1 = nn.Sequential(
             nn.Conv1d(input_channels, 48, 3, padding=1),
             nn.BatchNorm1d(48),
@@ -247,8 +247,8 @@ class AttentiveMultiScaleCNN(nn.Module):
 
 # EnhancedPositionalEncoding
 class EnhancedPositionalEncoding(nn.Module):
-    def _init_(self, d_model, max_len=1000, dropout=0.1):
-        super()._init_()
+    def __init__(self, d_model, max_len=1000, dropout=0.1):
+        super().__init__()
         self.dropout = nn.Dropout(p=dropout)
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
@@ -267,7 +267,7 @@ class EnhancedPositionalEncoding(nn.Module):
 
 # F1OptimizedTransformer
 class F1OptimizedTransformer(nn.Module):
-    def _init_(
+    def __init__(
         self,
         input_channels=3,
         d_model=384,
@@ -278,7 +278,7 @@ class F1OptimizedTransformer(nn.Module):
         num_classes=3,
         max_seq_len=1000,
     ):
-        super()._init_()
+        super().__init__()
         self.feature_extractor = AttentiveMultiScaleCNN(input_channels, d_model)
         self.pos_encoder = EnhancedPositionalEncoding(d_model, max_seq_len, dropout)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -287,7 +287,7 @@ class F1OptimizedTransformer(nn.Module):
             dim_feedforward,
             dropout,
             batch_first=True,
-            norm_first=True,
+            norm_first=False,  # CHANGED from True to False to fix nested_tensor warning
             activation="gelu",
         )
         self.transformer_encoder = nn.TransformerEncoder(
@@ -340,8 +340,8 @@ class F1OptimizedTransformer(nn.Module):
 
 # FocalLoss
 class FocalLoss(nn.Module):
-    def _init_(self, alpha=None, gamma=2.0, label_smoothing=0.0):
-        super()._init_()
+    def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.0):
+        super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.label_smoothing = label_smoothing
@@ -393,9 +393,7 @@ print("Class weights:", class_weights)
 # Loss and optimizer
 criterion = FocalLoss(alpha=class_weights, gamma=3.0, label_smoothing=0.1)
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.02)
-scheduler = ReduceLROnPlateau(
-    optimizer, mode="max", factor=0.5, patience=3, verbose=True
-)
+scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
 
 # Training loop
 best_f1 = 0
