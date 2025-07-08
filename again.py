@@ -4,7 +4,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, confusion_matrix, ConfusionMatrixDisplay
 from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter1d
+
 
 torch.backends.cudnn.benchmark = True  # speed
 
