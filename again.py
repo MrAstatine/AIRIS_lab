@@ -161,12 +161,12 @@ weights = torch.tensor(weights, dtype=torch.float32, device=device)
 criterion = FocalLoss(weights, gamma=2)
 opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=3e-2)
 sched = torch.optim.lr_scheduler.OneCycleLR(
-    opt, max_lr=1e-3, steps_per_epoch=len(train_ld), epochs=30, pct_start=0.3
+    opt, max_lr=1e-3, steps_per_epoch=len(train_ld), epochs=300, pct_start=0.3
 )
 
 # ----------11. Training loop ----------
-best_f1, patience_left = 0.0, 6
-for epoch in range(30):
+best_f1, patience_left = 0.0, 30  # Increased patience
+for epoch in range(300):
     # ---- train ----
     model.train()
     tot = 0
@@ -181,7 +181,8 @@ for epoch in range(30):
         tot += loss.item()
     # ---- validate ----
     model.eval()
-    preds = [], targs = []
+    preds = []
+    targs = []
     with torch.no_grad():
         for xb, yb in val_ld:
             xb = xb.to(device)
@@ -204,7 +205,7 @@ for epoch in range(30):
     print(f"Epoch {epoch+1:02d}  loss {tot/len(train_ld):.4f}  val-F1 {f1:.4f}")
 
     if f1 > best_f1:
-        best_f1, patience_left = f1, 6
+        best_f1, patience_left = f1, 30  # Reset patience
         torch.save(model.state_dict(), os.path.join(OUT_DIR, "best_model.pth"))
     else:
         patience_left -= 1
