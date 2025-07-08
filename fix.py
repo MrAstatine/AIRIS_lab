@@ -32,9 +32,10 @@ output_dir = "./outputs"
 os.makedirs(output_dir, exist_ok=True)
 
 # Load dataset
-dataset_path = "final_dataset.npz"
+# dataset_path = "final_dataset.npz"
+dataset_path = "combined_dataset.npz"
 try:
-    data_npz = np.load(dataset_path)
+    data_npz = np.load(dataset_path, allow_pickle=True)
     print("Available keys in .npz file:", list(data_npz.keys()))
     X = data_npz["data"]
     y = data_npz["label"]

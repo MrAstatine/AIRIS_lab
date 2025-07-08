@@ -32,9 +32,10 @@ output_dir = "./outputs"
 os.makedirs(output_dir, exist_ok=True)
 
 # Load dataset
-dataset_path = "final_dataset.npz"  # Update path if needed
+# dataset_path = "final_dataset.npz"  # Update path if needed
+dataset_path = "combined_dataset.npz"
 try:
-    data_npz = np.load(dataset_path)
+    data_npz = np.load(dataset_path, allow_pickle=True)
     print("Available keys in .npz file:", list(data_npz.keys()))
     X = data_npz["data"]
     y = data_npz["label"]
@@ -157,7 +158,9 @@ class F1OptimizedAugmentation:
 
 # F1FocusedDataset
 class F1FocusedDataset(Dataset):
-    def __init__(self, data, labels, normalize=True, augment=False, class_weights=None):  # FIXED: was _init_
+    def __init__(
+        self, data, labels, normalize=True, augment=False, class_weights=None
+    ):  # FIXED: was _init_
         self.original_data = torch.FloatTensor(data)
         self.labels = torch.LongTensor(labels)
         self.augment = augment
@@ -560,7 +563,10 @@ torch.save(model.state_dict(), os.path.join(output_dir, "final_model.pth"))
 history = {"train_losses": train_losses, "val_f1s": val_f1s}
 np.savez(os.path.join(output_dir, "training_history.npz"), **history)
 # Save class weights
-np.savez(os.path.join(output_dir, "class_weights.npz"), class_weights=class_weights.cpu().numpy())  # FIXED: move to CPU and convert to numpy before saving
+np.savez(
+    os.path.join(output_dir, "class_weights.npz"),
+    class_weights=class_weights.cpu().numpy(),
+)  # FIXED: move to CPU and convert to numpy before saving
 print("Training complete. Outputs saved to:", output_dir)
 print("Final model saved as final_model.pth")
 print("Training history saved as training_history.npz")
