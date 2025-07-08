@@ -276,7 +276,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.001)
 scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=0.0001)
 
 # Training loop
-num_epochs = 50
+num_epochs = 150
 best_f1 = 0
 patience = 15
 counter = 0
