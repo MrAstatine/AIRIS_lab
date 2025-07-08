@@ -437,7 +437,8 @@ def optimized_hyperparameter_search(data, labels, n_trials=8):  # Reduced trials
 
 
 # === Load dataset ===
-datafile = "final_dataset.npz"
+# datafile = "final_dataset.npz"
+datafile = "combined_dataset.npz"
 data_npz = np.load(datafile)
 print(f"Loaded {datafile}. Keys: {list(data_npz.keys())}")
 

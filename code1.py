@@ -472,7 +472,8 @@ def hyperparameter_search(data, labels, n_trials=10):
 
 
 # === Load dataset ===
-datafile = "final_dataset.npz"
+datafile = "combined_dataset.npz"
+# datafile = "final_dataset.npz"
 data_npz = np.load(datafile)
 print(f"Loaded {datafile}. Keys: {list(data_npz.keys())}")
 

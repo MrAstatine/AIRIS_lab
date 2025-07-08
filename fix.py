@@ -52,9 +52,9 @@ print("Label shape:", y.shape)
 print("Class counts:", np.bincount(y))
 
 # Validate shapes
-if X.shape != (2591, 1000, 3) or y.shape != (2591,):
+if X.shape != (2891, 1000, 3) or y.shape != (2891,):
     raise ValueError(
-        f"Expected data shape (2591, 1000, 3) and label shape (2591,), got {X.shape} and {y.shape}"
+        f"Expected data shape (2891, 1000, 3) and label shape (2891,), got {X.shape} and {y.shape}"
     )
 
 # Train-validation split
