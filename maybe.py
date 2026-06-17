@@ -15,49 +15,39 @@ from torch.optim.lr_scheduler import CyclicLR
 from scipy.ndimage import gaussian_filter1d
 import numpy as np
 import random
-import os
 import time
 
-# Set random seeds
-torch.manual_seed(42)
-np.random.seed(42)
-random.seed(42)
+# Modal imports
+import modal
 
-# Device configuration
+app = modal.App()
+image = (
+    modal.Image.debian_slim()
+    .pip_install("torch", "scikit-learn", "matplotlib", "numpy")
+    .add_local_file("combined_dataset.npz", remote_path="/root/combined_dataset.npz")
+)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+output_dir = "/root/outputs"  # This line remains unchanged
 
-# Create output directory
-output_dir = "./outputs"
-os.makedirs(output_dir, exist_ok=True)
 
-# Load dataset
-# dataset_path = "final_dataset.npz"  # Update path if needed
-dataset_path = "combined_dataset.npz"
-try:
-    data_npz = np.load(dataset_path, allow_pickle=True)
+def load_data():
+    data_npz = np.load("/root/merged_dataset.npz", allow_pickle=True)
     print("Available keys in .npz file:", list(data_npz.keys()))
     X = data_npz["data"]
     y = data_npz["label"]
-except FileNotFoundError:
-    print(f"Error: Dataset file not found at {dataset_path}")
-    raise
-except KeyError:
-    print("Error: 'data' or 'label' keys not found in .npz file")
-    raise
+    print("Data shape:", X.shape)
+    print("Label shape:", y.shape)
+    print("Class counts:", np.bincount(y))
+    if X.shape != (2891, 1000, 3) or y.shape != (2891,):
+        raise ValueError(
+            f"Expected data shape (2891, 1000, 3) and label shape (2891,), got {X.shape} and {y.shape}"
+        )
+    return X, y
 
-# Verify shapes and class distribution
-print("Data shape:", X.shape)
-print("Label shape:", y.shape)
-print("Class counts:", np.bincount(y))
 
-# Validate shapes
-if X.shape != (2891, 1000, 3) or y.shape != (2891,):
-    raise ValueError(
-        f"Expected data shape (2891, 1000, 3) and label shape (2891,), got {X.shape} and {y.shape}"
-    )
-
-# Train-validation split
+# Load data before splitting
+X, y = load_data()
 X_train, X_val, y_train, y_val = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y
 )
@@ -147,61 +137,11 @@ class F1OptimizedAugmentation:
         return augmented
 
     def __call__(self, x, is_minority=False):  # FIXED: was _call_
-        return self.selective_cutout(
-            self.intelligent_noise(
-                self.magnitude_warp(self.time_warp(x, is_minority), is_minority),
-                is_minority,
-            ),
-            is_minority,
-        )
-
-
-# F1FocusedDataset
-class F1FocusedDataset(Dataset):
-    def __init__(
-        self, data, labels, normalize=True, augment=False, class_weights=None
-    ):  # FIXED: was _init_
-        self.original_data = torch.FloatTensor(data)
-        self.labels = torch.LongTensor(labels)
-        self.augment = augment
-        self.class_weights = class_weights
-        self.data = (
-            self._robust_normalize(self.original_data)
-            if normalize
-            else self.original_data.clone()
-        )
-        if augment:
-            self.augmenter = F1OptimizedAugmentation(prob=0.9)
-        self.minority_class = 2
-
-    def _robust_normalize(self, data):
-        normed = data.clone()
-        for c in range(data.shape[2]):
-            channel_data = data[:, :, c]
-            q05, q25, q50, q75, q95 = torch.quantile(
-                channel_data.flatten(), torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95])
-            )
-            iqr = q75 - q25
-            clipped = torch.clamp(channel_data, q05, q95)
-            if iqr > 1e-6:
-                normed[:, :, c] = (clipped - q50) / (1.4826 * iqr)
-            else:
-                mean, std = clipped.mean(), clipped.std()
-                normed[:, :, c] = (clipped - mean) / (std + 1e-8)
-        return normed
-
-    def __len__(self):  # FIXED: was _len_
-        return len(self.data)
-
-    def __getitem__(self, idx):  # FIXED: was _getitem_
-        x = self.data[idx].clone()
-        y = self.labels[idx]
-        if self.augment:
-            is_minority = y == self.minority_class
-            aug_prob = 0.95 if is_minority else 0.65
-            if random.random() < aug_prob:
-                x = self.augmenter(x, is_minority=is_minority)
-        return x, y
+        x = self.time_warp(x, is_minority)
+        x = self.magnitude_warp(x, is_minority)
+        x = self.intelligent_noise(x, is_minority)
+        x = self.selective_cutout(x, is_minority)
+        return x
 
 
 # AttentiveMultiScaleCNN
@@ -209,16 +149,10 @@ class AttentiveMultiScaleCNN(nn.Module):
     def __init__(self, input_channels, d_model):  # FIXED: was _init_
         super().__init__()  # FIXED: was super()._init_()
         self.scale1 = nn.Sequential(
-            nn.Conv1d(input_channels, 48, 3, padding=1),
             nn.BatchNorm1d(48),
             nn.GELU(),
-            nn.Conv1d(48, 64, 3, padding=1),
             nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.Conv1d(64, 80, 3, padding=1),
-            nn.BatchNorm1d(80),
-            nn.GELU(),
-            nn.Conv1d(80, 80, 3, padding=1),
             nn.BatchNorm1d(80),
             nn.GELU(),
         )
@@ -401,6 +335,49 @@ sampler = WeightedRandomSampler(
     weights=sample_weights, num_samples=len(y_train), replacement=True
 )
 
+
+# F1FocusedDataset definition
+class F1FocusedDataset(torch.utils.data.Dataset):
+    def __init__(self, data, labels, normalize=True, augment=False, class_weights=None):
+        self.original_data = torch.FloatTensor(data)
+        self.labels = torch.LongTensor(labels)
+        self.augment = augment
+        self.class_weights = class_weights
+        self.data = (
+            self._robust_normalize(self.original_data)
+            if normalize
+            else self.original_data.clone()
+        )
+        if augment:
+            self.augmenter = F1OptimizedAugmentation(prob=0.9)
+        self.minority_class = 2
+
+    def _robust_normalize(self, data):
+        normed = data.clone()
+        for c in range(data.shape[2]):
+            channel_data = data[:, :, c]
+            q05, q25, q50, q75, q95 = torch.quantile(
+                channel_data.flatten(), torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95])
+            )
+            iqr = q75 - q25
+            clipped = torch.clamp(channel_data, q05, q95)
+            if iqr > 1e-6:
+                mean, std = clipped.mean(), clipped.std()
+                normed[:, :, c] = (clipped - mean) / (std + 1e-8)
+        return normed
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        x = self.data[idx].clone()
+        y = self.labels[idx]
+        if self.augment:
+            is_minority = y == self.minority_class
+            x = self.augmenter(x, is_minority=is_minority)
+        return x, y
+
+
 # DataLoaders
 train_dataset = F1FocusedDataset(X_train, y_train, normalize=True, augment=True)
 val_dataset = F1FocusedDataset(X_val, y_val, normalize=True, augment=False)
@@ -438,7 +415,7 @@ scheduler = CyclicLR(
 # Training loop
 num_epochs = 150
 best_f1 = 0
-patience = 15
+patience = 30
 counter = 0
 train_losses, val_f1s = [], []
 for epoch in range(num_epochs):
@@ -480,13 +457,11 @@ for epoch in range(num_epochs):
     if val_f1 > best_f1:
         best_f1 = val_f1
         counter = 0
-        torch.save(model.state_dict(), os.path.join(output_dir, "best_model.pth"))
+        torch.save(model.state_dict(), f"{output_dir}/best_model.pth")
     else:
         counter += 1
     if (epoch + 1) % 10 == 0:
-        torch.save(
-            model.state_dict(), os.path.join(output_dir, f"model_epoch_{epoch+1}.pth")
-        )
+        torch.save(model.state_dict(), f"{output_dir}/model_epoch_{epoch+1}.pth")
     if counter >= patience:
         print("Early stopping")
         break
@@ -516,58 +491,59 @@ for i, name in enumerate(class_names):
         f"{name} F1: {metrics['per_class_f1'][i]:.4f}, Precision: {metrics['per_class_precision'][i]:.4f}, Recall: {metrics['per_class_recall'][i]:.4f}"
     )
 
-# Plot confusion matrix
-disp = ConfusionMatrixDisplay(
-    confusion_matrix=metrics["confusion_matrix"], display_labels=class_names
-)
-disp.plot(cmap=plt.cm.Blues)
-plt.title("Confusion Matrix")
-plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
-plt.close()
-
-# Plot training loss and validation F1
-plt.plot(train_losses, label="Training Loss")
-plt.plot(val_f1s, label="Validation F1")
-plt.xlabel("Epoch")
-plt.legend()
-plt.savefig(os.path.join(output_dir, "training_plot.png"))
-plt.close()
-
-# Visualize augmented sample
-eb_idx = np.where(y_train == 2)[0][0]
-x = torch.FloatTensor(X_train[eb_idx])
-augmenter = F1OptimizedAugmentation(prob=1.0)
-x_aug = augmenter(x, is_minority=True)
-plt.figure(figsize=(12, 4))
-for c, name in enumerate(["Flux", "Centroid", "Background"]):
-    plt.subplot(1, 3, c + 1)
-    plt.plot(x[:, c], label="Original")
-    plt.plot(x_aug[:, c], label="Augmented", alpha=0.7)
-    plt.title(f"{name} Channel")
-    plt.legend()
-plt.savefig(os.path.join(output_dir, "augmented_sample.png"))
-plt.close()
-
-# Visualize EB validation samples
-eb_val_idx = np.where(y_val == 2)[0][:3]
-for idx in eb_val_idx:
-    plt.figure(figsize=(6, 4))
-    plt.plot(X_val[idx, :, 0], label="Flux")
-    plt.title(f"EB Validation Sample {idx}")
-    plt.legend()
-    plt.savefig(os.path.join(output_dir, f"eb_sample_{idx}.png"))
+    # Plot confusion matrix
+    disp = ConfusionMatrixDisplay(
+        confusion_matrix=metrics["confusion_matrix"], display_labels=class_names
+    )
+    disp.plot(cmap=plt.cm.Blues)
+    plt.title("Confusion Matrix")
+    plt.savefig(f"{output_dir}/confusion_matrix.png")
     plt.close()
-# Save final model
-torch.save(model.state_dict(), os.path.join(output_dir, "final_model.pth"))
-# Save training history
-history = {"train_losses": train_losses, "val_f1s": val_f1s}
-np.savez(os.path.join(output_dir, "training_history.npz"), **history)
-# Save class weights
-np.savez(
-    os.path.join(output_dir, "class_weights.npz"),
-    class_weights=class_weights.cpu().numpy(),
-)  # FIXED: move to CPU and convert to numpy before saving
-print("Training complete. Outputs saved to:", output_dir)
-print("Final model saved as final_model.pth")
-print("Training history saved as training_history.npz")
-print("Class weights saved as class_weights.npz")
+
+    # Plot training loss and validation F1
+    plt.plot(train_losses, label="Training Loss")
+    plt.plot(val_f1s, label="Validation F1")
+    plt.xlabel("Epoch")
+    plt.legend()
+    plt.savefig(f"{output_dir}/training_plot.png")
+    plt.close()
+
+    # Visualize augmented sample
+    eb_idx = np.where(y_train == 2)[0][0]
+    x = torch.FloatTensor(X_train[eb_idx])
+    augmenter = F1OptimizedAugmentation(prob=1.0)
+    x_aug = augmenter(x, is_minority=True)
+    plt.figure(figsize=(12, 4))
+    for c, name in enumerate(["Flux", "Centroid", "Background"]):
+        plt.subplot(1, 3, c + 1)
+        plt.plot(x[:, c], label="Original")
+        plt.plot(x_aug[:, c], label="Augmented", alpha=0.7)
+        plt.title(f"{name} Channel")
+        plt.legend()
+    plt.savefig(f"{output_dir}/augmented_sample.png")
+    plt.close()
+
+    # Visualize EB validation samples
+    eb_val_idx = np.where(y_val == 2)[0][:3]
+    for idx in eb_val_idx:
+        plt.figure(figsize=(6, 4))
+        plt.plot(X_val[idx, :, 0], label="Flux")
+        plt.title(f"EB Validation Sample {idx}")
+        plt.legend()
+        plt.savefig(f"{output_dir}/eb_sample_{idx}.png")
+        plt.close()
+
+    # Save final model
+    torch.save(model.state_dict(), f"{output_dir}/final_model.pth")
+    # Save training history
+    history = {"train_losses": train_losses, "val_f1s": val_f1s}
+    np.savez(f"{output_dir}/training_history.npz", **history)
+    # Save class weights
+    np.savez(
+        f"{output_dir}/class_weights.npz",
+        class_weights=class_weights.cpu().numpy(),
+    )  # FIXED: move to CPU and convert to numpy before saving
+    print("Training complete. Outputs saved to:", output_dir)
+    print("Final model saved as final_model.pth")
+    print("Training history saved as training_history.npz")
+    print("Class weights saved as class_weights.npz")
